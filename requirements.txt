@@ -1,0 +1,5 @@
+yfinance>=0.2.54
+pandas>=2.2.0
+numpy>=1.26.0
+lxml>=5.2.0
+html5lib>=1.1

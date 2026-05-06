@@ -1,0 +1,32 @@
+name: CAN SLIM Daily Screener
+
+on:
+  schedule:
+    # 06:00 UTC = 08:00 CEST (Spain summer) / 07:00 CET (Spain winter)
+    - cron: '0 6 * * 1-5'
+  workflow_dispatch:   # enables manual "Run workflow" button in GitHub UI
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run CAN SLIM screener
+        env:
+          GMAIL_ADDRESS:      ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECIPIENT_EMAIL:    ${{ secrets.RECIPIENT_EMAIL }}
+        run: python screener.py
