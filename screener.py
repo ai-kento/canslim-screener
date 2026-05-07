@@ -4,15 +4,13 @@
 import io
 import os
 import logging
-import smtplib
+import resend
 import requests
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -304,30 +302,16 @@ def build_email_html(top10: list[dict], spy: dict) -> str:
 
 
 def send_email(html: str):
-    sender = os.environ["GMAIL_ADDRESS"]
-    password = os.environ["GMAIL_APP_PASSWORD"]
+    resend.api_key = os.environ["RESEND_API_KEY"]
     recipient = os.environ["RECIPIENT_EMAIL"]
-
     date_str = datetime.now().strftime("%b %d, %Y")
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"📊 CAN SLIM Top 10 — {date_str}"
-    msg["From"] = f"CAN SLIM Screener <{sender}>"
-    msg["To"] = recipient
-    msg.attach(MIMEText(html, "html"))
 
-    # Try port 587 (STARTTLS) first, fall back to 465 (SSL)
-    try:
-        with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as smtp:
-            smtp.ehlo()
-            smtp.starttls()
-            smtp.ehlo()
-            smtp.login(sender, password)
-            smtp.sendmail(sender, recipient, msg.as_string())
-    except smtplib.SMTPAuthenticationError:
-        log.warning("Port 587 auth failed, trying port 465...")
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as smtp:
-            smtp.login(sender, password)
-            smtp.sendmail(sender, recipient, msg.as_string())
+    resend.Emails.send({
+        "from": "CAN SLIM Screener <onboarding@resend.dev>",
+        "to": [recipient],
+        "subject": f"📊 CAN SLIM Top 10 — {date_str}",
+        "html": html,
+    })
     log.info(f"Email sent to {recipient}")
 
 

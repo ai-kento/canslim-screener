@@ -28,7 +28,6 @@ jobs:
 
       - name: Run CAN SLIM screener
         env:
-          GMAIL_ADDRESS:      ${{ secrets.GMAIL_ADDRESS }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          RECIPIENT_EMAIL:    ${{ secrets.RECIPIENT_EMAIL }}
+          RESEND_API_KEY:  ${{ secrets.RESEND_API_KEY }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
         run: python screener.py
