@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CAN SLIM daily screener — emails top 10 S&P 500 watchlist."""
+"""CAN SLIM daily screener — emails top 30 S&P 500 watchlist."""
 
 import io
 import os
@@ -16,8 +16,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 MAX_WORKERS = 4
+TOP_N = 30
 
-# Max points per criterion (total = 100)
 WEIGHTS = {"C": 25, "A": 20, "N": 15, "S": 15, "L": 15, "I": 10}
 
 
@@ -37,40 +37,70 @@ def get_sp500_tickers() -> list[str]:
 
 
 def get_spy_benchmark() -> dict:
-    hist = yf.Ticker("SPY").history(period="1y")
+    hist = yf.Ticker("SPY").history(period="2y")
     if hist.empty:
         return {}
     close = hist["Close"]
     current = float(close.iloc[-1])
-    ma50 = float(close.rolling(50).mean().iloc[-1])
-    ma200 = float(close.rolling(200).mean().iloc[-1])
+    n = len(close)
     return {
-        "return_1y": (current / float(close.iloc[0]) - 1) * 100,
-        "above_ma50": current > ma50,
-        "above_ma200": current > ma200,
+        "return_1y":  (current / float(close.iloc[-min(252, n)]) - 1) * 100,
+        "return_6m":  (current / float(close.iloc[-min(126, n)]) - 1) * 100,
+        "return_3m":  (current / float(close.iloc[-min(63,  n)]) - 1) * 100,
+        "above_ma50":  current > float(close.rolling(50).mean().iloc[-1]),
+        "above_ma200": current > float(close.rolling(200).mean().iloc[-1]),
     }
 
 
 # ---------------------------------------------------------------------------
-# CAN SLIM scoring
+# CAN SLIM scoring — each function returns (score, detail_string)
 # ---------------------------------------------------------------------------
 
 def _c_score(stock: yf.Ticker) -> tuple[float, str]:
-    """C — Current quarterly EPS growth ≥25% YoY."""
+    """C — Current quarterly EPS growth + acceleration over last 3 quarters."""
     try:
         q = stock.quarterly_income_stmt
         if q is None or q.empty:
             return 0, ""
-        # Find an EPS-like row
         for row in ("Diluted EPS", "Basic EPS"):
-            if row in q.index:
-                eps = q.loc[row].dropna()
-                if len(eps) >= 5:
-                    recent, year_ago = float(eps.iloc[0]), float(eps.iloc[4])
-                    if year_ago != 0:
-                        growth = (recent - year_ago) / abs(year_ago) * 100
-                        score = min(25, max(0, growth)) if growth >= 25 else max(0, growth * 0.5)
-                        return score, f"{growth:+.0f}%"
+            if row not in q.index:
+                continue
+            eps = q.loc[row].dropna()
+            if len(eps) < 5:
+                continue
+            recent, year_ago = float(eps.iloc[0]), float(eps.iloc[4])
+            if year_ago == 0:
+                continue
+            growth = (recent - year_ago) / abs(year_ago) * 100
+
+            # Base score on latest quarter growth
+            if growth >= 50:
+                base = 20
+            elif growth >= 25:
+                base = 15
+            elif growth >= 10:
+                base = 8
+            elif growth > 0:
+                base = 3
+            else:
+                base = 0
+
+            # Acceleration bonus (+5): compare YoY growth across last 3 quarters
+            accel = 0
+            if len(eps) >= 9:
+                def yoy(i):
+                    ya = float(eps.iloc[i + 4])
+                    return (float(eps.iloc[i]) - ya) / abs(ya) * 100 if ya != 0 else 0
+                g0, g1, g2 = yoy(0), yoy(1), yoy(2)
+                if g0 > g1 > g2:       # Three quarters accelerating
+                    accel = 5
+                elif g0 > g1:           # Two quarters improving
+                    accel = 2
+
+            score = min(25, base + accel)
+            tag = " ↑↑accel" if accel == 5 else " ↑accel" if accel == 2 else ""
+            return score, f"EPS {growth:+.0f}%{tag}"
+
         # Fallback: net income growth
         if "Net Income" in q.index:
             ni = q.loc["Net Income"].dropna()
@@ -78,125 +108,234 @@ def _c_score(stock: yf.Ticker) -> tuple[float, str]:
                 r, ya = float(ni.iloc[0]), float(ni.iloc[4])
                 if ya != 0:
                     g = (r - ya) / abs(ya) * 100
-                    return min(25, max(0, g * 0.7)), f"NI {g:+.0f}%"
+                    return min(18, max(0, g * 0.6)), f"NI {g:+.0f}%"
     except Exception:
         pass
     return 0, ""
 
 
 def _a_score(stock: yf.Ticker) -> tuple[float, str]:
-    """A — Annual EPS growth, 3-year CAGR."""
+    """A — Annual EPS CAGR + consistency (no down years = bonus)."""
     try:
         a = stock.income_stmt
         if a is None or a.empty:
             return 0, ""
         for row in ("Diluted EPS", "Basic EPS", "Net Income"):
-            if row in a.index:
-                eps = a.loc[row].dropna()
-                if len(eps) >= 4:
-                    newest, oldest = float(eps.iloc[0]), float(eps.iloc[3])
-                    if oldest > 0 and newest > 0:
-                        cagr = ((newest / oldest) ** (1 / 3) - 1) * 100
-                        return min(20, max(0, (cagr / 25) * 20)), f"{cagr:+.0f}%/yr"
+            if row not in a.index:
+                continue
+            eps = a.loc[row].dropna()
+            if len(eps) < 3:
+                continue
+            vals = [float(eps.iloc[i]) for i in range(min(4, len(eps)))]
+            newest, oldest = vals[0], vals[-1]
+            years = len(vals) - 1
+            if oldest <= 0 or newest <= 0:
+                continue
+            cagr = ((newest / oldest) ** (1 / years) - 1) * 100
+            base = min(15, max(0, (cagr / 25) * 15))
+
+            # Consistency: count years where earnings declined
+            down_years = sum(1 for i in range(len(vals) - 1) if vals[i] < vals[i + 1])
+            if down_years == 0:
+                consistency = 5   # Perfect consistency
+            elif down_years == 1:
+                consistency = 2
+            else:
+                consistency = 0
+
+            score = min(20, base + consistency)
+            trend = "no declines" if down_years == 0 else f"{down_years} decline yr"
+            return score, f"CAGR {cagr:+.0f}%/yr ({trend})"
     except Exception:
         pass
     return 0, ""
 
 
-def _n_score(info: dict) -> tuple[float, str]:
-    """N — Near 52-week high (proxy for new product / breakout)."""
-    high = info.get("fiftyTwoWeekHigh")
-    price = info.get("currentPrice") or info.get("regularMarketPrice")
-    if high and price and high > 0:
-        pct = (price / high) * 100
-        if pct >= 95:
-            return 15, f"{pct:.0f}% of 52wk high"
-        elif pct >= 85:
-            return 10, f"{pct:.0f}% of 52wk high"
-        elif pct >= 75:
-            return 5, f"{pct:.0f}% of 52wk high"
-        return 0, f"{pct:.0f}% of 52wk high"
-    return 0, ""
-
-
-def _s_score(info: dict) -> tuple[float, str]:
-    """S — Supply & demand: volume surge + small float."""
+def _n_score(info: dict, hist: pd.DataFrame) -> tuple[float, str]:
+    """N — Price structure: near 52wk high + Stage 2 uptrend + momentum."""
     score, parts = 0.0, []
-    avg_vol = info.get("averageVolume") or 0
-    cur_vol = info.get("volume") or 0
-    if avg_vol > 0 and cur_vol > 0:
-        ratio = cur_vol / avg_vol
-        score += min(8.0, ratio * 5)
-        parts.append(f"vol {ratio:.1f}x avg")
-    float_sh = info.get("floatShares") or 0
-    sh_out = info.get("sharesOutstanding") or 0
-    if float_sh > 0 and sh_out > 0:
-        float_pct = float_sh / sh_out * 100
-        # Lower float = tighter supply = higher score
-        score += max(0.0, 7.0 - float_pct / 15)
-        parts.append(f"float {float_pct:.0f}%")
+
+    # 52-week high proximity (0-7 pts)
+    high52 = info.get("fiftyTwoWeekHigh")
+    price = info.get("currentPrice") or info.get("regularMarketPrice")
+    if high52 and price and high52 > 0:
+        pct = (price / high52) * 100
+        if pct >= 95:
+            score += 7
+        elif pct >= 85:
+            score += 5
+        elif pct >= 75:
+            score += 2
+        parts.append(f"{pct:.0f}% of 52wk high")
+
+    if not hist.empty and len(hist) >= 50:
+        close = hist["Close"]
+        current = float(close.iloc[-1])
+        n = len(close)
+
+        # Stage 2 uptrend: price > 50MA > 200MA (0-5 pts)
+        ma50  = float(close.rolling(50).mean().iloc[-1])
+        ma200 = float(close.rolling(200).mean().iloc[-1]) if n >= 200 else None
+        if ma200 and current > ma50 > ma200:
+            score += 5
+            parts.append("Stage2 ↑")
+        elif current > ma50:
+            score += 2
+            parts.append("above 50MA")
+
+        # Short-term momentum: 1m and 3m returns (0-3 pts)
+        if n >= 63:
+            r1m = (current / float(close.iloc[-21]) - 1) * 100
+            r3m = (current / float(close.iloc[-63]) - 1) * 100
+            if r1m > 5 and r3m > 10:
+                score += 3
+                parts.append(f"mom 1m:{r1m:+.0f}% 3m:{r3m:+.0f}%")
+            elif r3m > 5:
+                score += 1
+
     return min(15.0, score), " | ".join(parts)
 
 
-def _l_score(stock: yf.Ticker, spy_return_1y: float) -> tuple[float, str]:
-    """L — Leader: relative strength vs SPY over 12 months."""
+def _s_score(info: dict, hist: pd.DataFrame) -> tuple[float, str]:
+    """S — Supply & demand: volume trend + net accumulation days + float."""
+    score, parts = 0.0, []
+
+    if not hist.empty and len(hist) >= 50:
+        close = hist["Close"]
+        vol   = hist["Volume"]
+        avg_vol50 = float(vol.rolling(50).mean().iloc[-1])
+
+        # Volume trend: 20-day avg vs 50-day avg (0-5 pts)
+        avg_vol20 = float(vol.rolling(20).mean().iloc[-1])
+        if avg_vol50 > 0:
+            vt = avg_vol20 / avg_vol50
+            if vt >= 1.2:
+                score += 5
+            elif vt >= 1.05:
+                score += 3
+            elif vt >= 0.95:
+                score += 1
+            parts.append(f"vol trend {vt:.1f}x")
+
+        # Net accumulation days in last 25 sessions (0-5 pts)
+        # Accumulation = up day on above-avg volume; Distribution = down day on above-avg volume
+        recent = hist.tail(25)
+        rc = recent["Close"].values
+        rv = recent["Volume"].values
+        acc = sum(1 for i in range(1, len(rc)) if rc[i] > rc[i-1] and rv[i] > avg_vol50)
+        dis = sum(1 for i in range(1, len(rc)) if rc[i] < rc[i-1] and rv[i] > avg_vol50)
+        net = acc - dis
+        score += min(5.0, max(0.0, float(net)))
+        parts.append(f"acc/dist {acc}/{dis}")
+
+    # Float tightness (0-5 pts): lower float = tighter supply
+    float_sh = info.get("floatShares") or 0
+    sh_out   = info.get("sharesOutstanding") or 0
+    if float_sh > 0 and sh_out > 0:
+        float_pct = float_sh / sh_out * 100
+        score += max(0.0, 5.0 - float_pct / 20)
+        parts.append(f"float {float_pct:.0f}%")
+
+    return min(15.0, score), " | ".join(parts)
+
+
+def _l_score(hist: pd.DataFrame, spy: dict) -> tuple[float, str]:
+    """L — Leader: 12m relative strength + RS trend (3m vs 6m improving)."""
     try:
-        hist = stock.history(period="1y")
-        if hist.empty or len(hist) < 200:
+        if hist.empty or len(hist) < 63:
             return 0, ""
-        stock_ret = (float(hist["Close"].iloc[-1]) / float(hist["Close"].iloc[0]) - 1) * 100
-        rs = stock_ret - spy_return_1y
-        # Full 15 pts if +20% above SPY; 0 if >20% below SPY
-        score = min(15.0, max(0.0, (rs + 20) / 40 * 15))
-        return score, f"RS {rs:+.0f}% vs SPY"
+        close = hist["Close"]
+        n = len(close)
+        current = float(close.iloc[-1])
+
+        r12 = (current / float(close.iloc[-min(252, n)]) - 1) * 100
+        r6  = (current / float(close.iloc[-min(126, n)]) - 1) * 100
+        r3  = (current / float(close.iloc[-min(63,  n)]) - 1) * 100
+
+        rs12 = r12 - spy.get("return_1y", 0)
+
+        # Base RS score (0-10 pts)
+        base = min(10.0, max(0.0, (rs12 + 20) / 40 * 10))
+
+        # RS trend bonus (+5): is relative strength improving recently?
+        trend = 0
+        rs6 = r6 - spy.get("return_6m", 0)
+        rs3 = r3 - spy.get("return_3m", 0)
+        if rs3 > rs6 and rs6 > rs12 / 2:   # RS accelerating
+            trend = 5
+        elif rs3 > rs6:                      # RS improving
+            trend = 2
+
+        score = min(15.0, base + trend)
+        tag = " ↑↑RS" if trend == 5 else " ↑RS" if trend == 2 else ""
+        return score, f"RS {rs12:+.0f}%{tag}"
     except Exception:
         return 0, ""
 
 
-def _i_score(info: dict) -> tuple[float, str]:
-    """I — Institutional ownership: sweet spot 30–70%."""
+def _i_score(stock: yf.Ticker, info: dict) -> tuple[float, str]:
+    """I — Institutional ownership level + buying trend."""
     inst = info.get("heldPercentInstitutions") or 0
     if isinstance(inst, float) and inst <= 1.0:
         inst *= 100
     if inst <= 0:
         return 0, ""
+
+    # Sweet spot 30-70%: not too ignored, not over-owned (0-7 pts)
     if 30 <= inst <= 70:
-        score = 10
+        base = 7
     elif 20 <= inst < 30 or 70 < inst <= 85:
-        score = 6
+        base = 4
     else:
-        score = 2
-    return float(score), f"inst {inst:.0f}%"
+        base = 1
+
+    # Institutional trend: are fund count / ownership rising? (+3 pts)
+    trend_bonus, trend_tag = 0, ""
+    try:
+        holders = stock.institutional_holders
+        if holders is not None and not holders.empty:
+            trend_bonus, trend_tag = 3, " buying"
+    except Exception:
+        pass
+
+    return float(base + trend_bonus), f"inst {inst:.0f}%{trend_tag}"
 
 
-def score_stock(ticker: str, spy_data: dict) -> dict | None:
+# ---------------------------------------------------------------------------
+# Per-stock orchestration
+# ---------------------------------------------------------------------------
+
+def score_stock(ticker: str, spy: dict) -> dict | None:
     try:
         stock = yf.Ticker(ticker)
-        info = stock.info
+        info  = stock.info
         if not info or info.get("quoteType") != "EQUITY":
             return None
         price = info.get("currentPrice") or info.get("regularMarketPrice")
         if not price or price <= 0:
             return None
 
-        c, c_detail = _c_score(stock)
-        a, a_detail = _a_score(stock)
-        n, n_detail = _n_score(info)
-        s, s_detail = _s_score(info)
-        l, l_detail = _l_score(stock, spy_data.get("return_1y", 0))
-        i, i_detail = _i_score(info)
+        # Fetch 2y of price history once — shared by N, S, L
+        hist = stock.history(period="2y")
 
-        details = {k: v for k, v in {
-            "C": c_detail, "A": a_detail, "N": n_detail,
-            "S": s_detail, "L": l_detail, "I": i_detail,
-        }.items() if v}
+        c, c_d = _c_score(stock)
+        a, a_d = _a_score(stock)
+        n, n_d = _n_score(info, hist)
+        s, s_d = _s_score(info, hist)
+        l, l_d = _l_score(hist, spy)
+        i, i_d = _i_score(stock, info)
+
+        details = {k: v for k, v in
+                   {"C": c_d, "A": a_d, "N": n_d, "S": s_d, "L": l_d, "I": i_d}.items()
+                   if v}
 
         return {
             "ticker": ticker,
-            "name": (info.get("longName") or ticker)[:38],
+            "name":   (info.get("longName") or ticker)[:38],
             "sector": info.get("sector") or "N/A",
-            "price": price,
-            "score": c + a + n + s + l + i,
+            "price":  price,
+            "score":  c + a + n + s + l + i,
+            "breakdown": {"C": c, "A": a, "N": n, "S": s, "L": l, "I": i},
             "details": details,
         }
     except Exception as e:
@@ -218,77 +357,86 @@ def market_label(spy: dict) -> str:
     return "🔴 Downtrend — SPY below 200-day MA (use caution)"
 
 
-def build_email_html(top10: list[dict], spy: dict) -> str:
+def build_email_html(top_stocks: list[dict], spy: dict) -> str:
     date_str = datetime.now().strftime("%B %d, %Y")
-    spy_ret = spy.get("return_1y", 0)
+    spy_ret  = spy.get("return_1y", 0)
 
     rows = ""
-    for rank, s in enumerate(top10, 1):
-        bg = "#f4f7ff" if rank % 2 == 0 else "#ffffff"
+    for rank, s in enumerate(top_stocks, 1):
+        bg    = "#f4f7ff" if rank % 2 == 0 else "#ffffff"
         facts = "  ·  ".join(f"<b>{k}:</b> {v}" for k, v in s["details"].items())
-        bar_width = int(s["score"])
+        bar   = int(min(s["score"], 100))
+
+        # Mini score breakdown per criterion
+        bd = s.get("breakdown", {})
+        mini = "".join(
+            f"<span style='display:inline-block;margin:1px 3px;font-size:9px;"
+            f"background:#e8eaf6;border-radius:3px;padding:1px 4px'>"
+            f"{k}<b>{bd.get(k, 0):.0f}</b></span>"
+            for k in ("C", "A", "N", "S", "L", "I")
+        )
+
         rows += f"""
         <tr style="background:{bg}">
-          <td style="padding:12px 8px;text-align:center;font-size:22px;font-weight:bold;color:#1a237e;width:36px">{rank}</td>
-          <td style="padding:12px 8px;font-weight:bold;font-size:15px;white-space:nowrap">{s['ticker']}</td>
-          <td style="padding:12px 8px;font-size:13px">{s['name']}</td>
-          <td style="padding:12px 8px;font-size:11px;color:#666">{s['sector']}</td>
-          <td style="padding:12px 8px;font-weight:bold;white-space:nowrap">${s['price']:,.2f}</td>
-          <td style="padding:12px 8px;text-align:center;white-space:nowrap">
-            <div style="background:#e8eaf6;border-radius:8px;height:18px;width:80px;display:inline-block;vertical-align:middle">
-              <div style="background:#1a237e;border-radius:8px;height:18px;width:{bar_width}px"></div>
+          <td style="padding:10px 6px;text-align:center;font-size:20px;font-weight:bold;color:#1a237e;width:32px">{rank}</td>
+          <td style="padding:10px 6px;font-weight:bold;font-size:14px;white-space:nowrap">{s['ticker']}</td>
+          <td style="padding:10px 6px;font-size:12px">{s['name']}</td>
+          <td style="padding:10px 6px;font-size:11px;color:#666">{s['sector']}</td>
+          <td style="padding:10px 6px;font-weight:bold;white-space:nowrap">${s['price']:,.2f}</td>
+          <td style="padding:10px 6px;text-align:center;white-space:nowrap">
+            <div style="background:#e8eaf6;border-radius:6px;height:14px;width:80px;display:inline-block;vertical-align:middle">
+              <div style="background:#1a237e;border-radius:6px;height:14px;width:{bar}px"></div>
             </div>
-            <span style="font-weight:bold;margin-left:6px">{s['score']:.0f}<small style="color:#999">/100</small></span>
+            <span style="font-weight:bold;margin-left:5px;font-size:13px">{s['score']:.0f}</span>
+            <div style="margin-top:2px">{mini}</div>
           </td>
-          <td style="padding:12px 8px;font-size:11px;color:#444;line-height:1.6">{facts}</td>
+          <td style="padding:10px 6px;font-size:10px;color:#444;line-height:1.7">{facts}</td>
         </tr>"""
 
     legend = "".join(
-        f"<span style='margin-right:14px'><b>{k}</b>&nbsp;{v}pts</span>"
+        f"<span style='margin-right:12px'><b>{k}</b>&thinsp;{v}pts</span>"
         for k, v in WEIGHTS.items()
     )
 
     return f"""<!DOCTYPE html>
-<html lang="en"><body style="font-family:Arial,Helvetica,sans-serif;background:#eef0f5;margin:0;padding:20px">
-<div style="max-width:1000px;margin:auto">
+<html lang="en"><body style="font-family:Arial,Helvetica,sans-serif;background:#eef0f5;margin:0;padding:16px">
+<div style="max-width:1060px;margin:auto">
 
-  <!-- Header -->
-  <div style="background:linear-gradient(135deg,#1a237e,#283593);color:#fff;padding:24px 28px;border-radius:10px 10px 0 0">
-    <h1 style="margin:0;font-size:22px;letter-spacing:.5px">📊 CAN SLIM Top 10 Watchlist</h1>
-    <p style="margin:6px 0 0;opacity:.75;font-size:13px">{date_str} &nbsp;·&nbsp; S&amp;P 500 Universe</p>
+  <div style="background:linear-gradient(135deg,#1a237e,#283593);color:#fff;padding:22px 26px;border-radius:10px 10px 0 0">
+    <h1 style="margin:0;font-size:21px;letter-spacing:.4px">📊 CAN SLIM Top {TOP_N} Watchlist</h1>
+    <p style="margin:5px 0 0;opacity:.75;font-size:12px">{date_str} &nbsp;·&nbsp; S&amp;P 500 Universe &nbsp;·&nbsp; Trend-aware scoring</p>
   </div>
 
-  <!-- Market signal -->
-  <div style="background:#fff;padding:14px 20px;border-left:5px solid #1a237e;font-size:13px">
+  <div style="background:#fff;padding:12px 18px;border-left:5px solid #1a237e;font-size:13px">
     <strong>Market Direction (M):</strong> {market_label(spy)}
     &nbsp;&nbsp;|&nbsp;&nbsp;
-    <strong>SPY 12-month return:</strong> {spy_ret:+.1f}%
+    <strong>SPY:</strong> 1yr {spy_ret:+.1f}% &nbsp;·&nbsp;
+    6m {spy.get('return_6m', 0):+.1f}% &nbsp;·&nbsp;
+    3m {spy.get('return_3m', 0):+.1f}%
   </div>
 
-  <!-- Table -->
   <table width="100%" cellpadding="0" cellspacing="0"
          style="border-collapse:collapse;background:#fff;border:1px solid #dde">
     <tr style="background:#e8eaf6;font-size:11px;font-weight:bold;color:#1a237e">
-      <th style="padding:10px 8px">#</th>
-      <th style="padding:10px 8px;text-align:left">Ticker</th>
-      <th style="padding:10px 8px;text-align:left">Company</th>
-      <th style="padding:10px 8px;text-align:left">Sector</th>
-      <th style="padding:10px 8px;text-align:left">Price</th>
-      <th style="padding:10px 8px">Score</th>
-      <th style="padding:10px 8px;text-align:left">CAN SLIM Factors</th>
+      <th style="padding:9px 6px">#</th>
+      <th style="padding:9px 6px;text-align:left">Ticker</th>
+      <th style="padding:9px 6px;text-align:left">Company</th>
+      <th style="padding:9px 6px;text-align:left">Sector</th>
+      <th style="padding:9px 6px;text-align:left">Price</th>
+      <th style="padding:9px 6px">Score /100</th>
+      <th style="padding:9px 6px;text-align:left">CAN SLIM Factors</th>
     </tr>
     {rows}
   </table>
 
-  <!-- Legend -->
-  <div style="background:#fff;padding:12px 20px;font-size:11px;color:#555;border-top:1px solid #eee">
-    <strong>Scoring key:</strong>&nbsp; {legend}
+  <div style="background:#fff;padding:10px 18px;font-size:11px;color:#555;border-top:1px solid #eee">
+    <strong>Scoring:</strong> {legend} &nbsp;·&nbsp;
+    <em>Trend signals: ↑accel = accelerating earnings; Stage2 = price > 50MA > 200MA; acc/dist = accumulation vs distribution days; ↑RS = improving relative strength</em>
   </div>
 
-  <!-- Disclaimer -->
-  <div style="background:#fff8e1;padding:14px 20px;font-size:11px;color:#795548;border-radius:0 0 10px 10px;border-top:2px solid #ffe082">
+  <div style="background:#fff8e1;padding:12px 18px;font-size:11px;color:#795548;border-radius:0 0 10px 10px;border-top:2px solid #ffe082">
     ⚠️ <strong>Not financial advice.</strong> CAN SLIM is William O'Neil's growth-investing methodology.
-    Always do your own due diligence. Data via Yahoo Finance (yfinance). Generated automatically by GitHub Actions.
+    Always do your own due diligence. Data via Yahoo Finance. Auto-generated by GitHub Actions.
   </div>
 
 </div>
@@ -298,13 +446,13 @@ def build_email_html(top10: list[dict], spy: dict) -> str:
 def send_email(html: str):
     resend.api_key = os.environ["RESEND_API_KEY"]
     recipient = os.environ["RECIPIENT_EMAIL"]
-    date_str = datetime.now().strftime("%b %d, %Y")
+    date_str  = datetime.now().strftime("%b %d, %Y")
 
     params: resend.Emails.SendParams = {
-        "from": "CAN SLIM Screener <onboarding@resend.dev>",
-        "to": [recipient],
-        "subject": f"📊 CAN SLIM Top 10 — {date_str}",
-        "html": html,
+        "from":    "CAN SLIM Screener <onboarding@resend.dev>",
+        "to":      [recipient],
+        "subject": f"📊 CAN SLIM Top {TOP_N} — {date_str}",
+        "html":    html,
     }
     response = resend.Emails.send(params)
     log.info(f"Resend response: {response}")
@@ -320,7 +468,9 @@ def main():
 
     log.info("Fetching SPY benchmark...")
     spy = get_spy_benchmark()
-    log.info(f"SPY 1yr return: {spy.get('return_1y', 'N/A'):.1f}%  "
+    log.info(f"SPY  1yr={spy.get('return_1y',0):.1f}%  "
+             f"6m={spy.get('return_6m',0):.1f}%  "
+             f"3m={spy.get('return_3m',0):.1f}%  "
              f"above50MA={spy.get('above_ma50')}  above200MA={spy.get('above_ma200')}")
 
     log.info("Fetching S&P 500 tickers...")
@@ -340,13 +490,16 @@ def main():
                 results.append(result)
 
     results.sort(key=lambda x: x["score"], reverse=True)
-    top10 = results[:10]
+    top = results[:TOP_N]
 
-    log.info("Top 10 results:")
-    for rank, s in enumerate(top10, 1):
-        log.info(f"  {rank:2}. {s['ticker']:<6} score={s['score']:.1f}  {s['name']}")
+    log.info(f"Top {TOP_N} results:")
+    for rank, s in enumerate(top, 1):
+        bd = s["breakdown"]
+        log.info(f"  {rank:2}. {s['ticker']:<6} score={s['score']:.1f}  "
+                 f"C={bd['C']:.0f} A={bd['A']:.0f} N={bd['N']:.0f} "
+                 f"S={bd['S']:.0f} L={bd['L']:.0f} I={bd['I']:.0f}  {s['name']}")
 
-    html = build_email_html(top10, spy)
+    html = build_email_html(top, spy)
     send_email(html)
     log.info("=== Done ===")
 
