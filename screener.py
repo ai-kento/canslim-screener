@@ -38,8 +38,14 @@ def get_sp500_tickers() -> list[str]:
     return df["Symbol"].str.replace(".", "-", regex=False).tolist()
 
 
+def _yf_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+    return s
+
+
 def get_spy_benchmark() -> dict:
-    hist = yf.Ticker("SPY").history(period="1y")
+    hist = yf.Ticker("SPY", session=_yf_session()).history(period="1y")
     if hist.empty:
         return {}
     close = hist["Close"]
@@ -173,7 +179,7 @@ def _i_score(info: dict) -> tuple[float, str]:
 
 def score_stock(ticker: str, spy_data: dict) -> dict | None:
     try:
-        stock = yf.Ticker(ticker)
+        stock = yf.Ticker(ticker, session=_yf_session())
         info = stock.info
         if not info or info.get("quoteType") != "EQUITY":
             return None
@@ -309,9 +315,19 @@ def send_email(html: str):
     msg["To"] = recipient
     msg.attach(MIMEText(html, "html"))
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-        smtp.login(sender, password)
-        smtp.sendmail(sender, recipient, msg.as_string())
+    # Try port 587 (STARTTLS) first, fall back to 465 (SSL)
+    try:
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as smtp:
+            smtp.ehlo()
+            smtp.starttls()
+            smtp.ehlo()
+            smtp.login(sender, password)
+            smtp.sendmail(sender, recipient, msg.as_string())
+    except smtplib.SMTPAuthenticationError:
+        log.warning("Port 587 auth failed, trying port 465...")
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as smtp:
+            smtp.login(sender, password)
+            smtp.sendmail(sender, recipient, msg.as_string())
     log.info(f"Email sent to {recipient}")
 
 
