@@ -36,14 +36,8 @@ def get_sp500_tickers() -> list[str]:
     return df["Symbol"].str.replace(".", "-", regex=False).tolist()
 
 
-def _yf_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
-    return s
-
-
 def get_spy_benchmark() -> dict:
-    hist = yf.Ticker("SPY", session=_yf_session()).history(period="1y")
+    hist = yf.Ticker("SPY").history(period="1y")
     if hist.empty:
         return {}
     close = hist["Close"]
@@ -177,7 +171,7 @@ def _i_score(info: dict) -> tuple[float, str]:
 
 def score_stock(ticker: str, spy_data: dict) -> dict | None:
     try:
-        stock = yf.Ticker(ticker, session=_yf_session())
+        stock = yf.Ticker(ticker)
         info = stock.info
         if not info or info.get("quoteType") != "EQUITY":
             return None
@@ -306,12 +300,14 @@ def send_email(html: str):
     recipient = os.environ["RECIPIENT_EMAIL"]
     date_str = datetime.now().strftime("%b %d, %Y")
 
-    resend.Emails.send({
+    params: resend.Emails.SendParams = {
         "from": "CAN SLIM Screener <onboarding@resend.dev>",
         "to": [recipient],
         "subject": f"📊 CAN SLIM Top 10 — {date_str}",
         "html": html,
-    })
+    }
+    response = resend.Emails.send(params)
+    log.info(f"Resend response: {response}")
     log.info(f"Email sent to {recipient}")
 
 
