@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """CAN SLIM daily screener — emails top 10 S&P 500 watchlist."""
 
+import io
 import os
 import logging
 import smtplib
+import requests
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -26,7 +28,13 @@ WEIGHTS = {"C": 25, "A": 20, "N": 15, "S": 15, "L": 15, "I": 10}
 # ---------------------------------------------------------------------------
 
 def get_sp500_tickers() -> list[str]:
-    df = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
+    resp = requests.get(
+        "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+        headers={"User-Agent": "Mozilla/5.0 (canslim-screener/1.0; +https://github.com/ai-kento/canslim-screener)"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    df = pd.read_html(io.StringIO(resp.text))[0]
     return df["Symbol"].str.replace(".", "-", regex=False).tolist()
 
 
